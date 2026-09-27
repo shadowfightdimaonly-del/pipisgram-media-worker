@@ -30,7 +30,44 @@ export default {
           corsHeaders,
         );
       }
+// Временный тест Filebase
+if (url.pathname === "/test-filebase" && request.method === "GET") {
+  const testContent = new TextEncoder().encode(
+    "Pipisgram Filebase test OK"
+  );
 
+  const response = await s3Request(
+    env,
+    "PUT",
+    "test/pipisgram-test.txt",
+    testContent.buffer,
+    "text/plain",
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+
+    return json(
+      {
+        ok: false,
+        error: "Filebase test failed",
+        details: errorText,
+      },
+      502,
+      corsHeaders,
+    );
+  }
+
+  return json(
+    {
+      ok: true,
+      message: "File successfully uploaded to Filebase",
+      key: "test/pipisgram-test.txt",
+    },
+    200,
+    corsHeaders,
+  );
+}
       // POST /upload
       if (url.pathname === "/upload" && request.method === "POST") {
         return await uploadFile(request, env, corsHeaders);
