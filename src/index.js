@@ -290,8 +290,10 @@ async function s3Request(
     payloadHash,
   ].join("\n");
 
-  const credentialScope =
-    `${dateStamp}/us-east-1/s3/aws4_request`;
+  const region = env.FILEBASE_REGION || "auto";
+
+const credentialScope =
+  `${dateStamp}/${region}/s3/aws4_request`;
 
   const canonicalRequestHash =
     await sha256Hex(
@@ -306,12 +308,12 @@ async function s3Request(
   ].join("\n");
 
   const signingKey =
-    await getSignatureKey(
-      env.FILEBASE_SECRET_KEY,
-      dateStamp,
-      "us-east-1",
-      "s3",
-    );
+  await getSignatureKey(
+    env.FILEBASE_SECRET_KEY,
+    dateStamp,
+    region,
+    "s3",
+  );
 
   const signature =
     await hmacHex(
