@@ -18,8 +18,7 @@ export default {
     try {
       const url = new URL(request.url);
 
-      // Проверка Worker
-      if (url.pathname === "/" && request.method === "GET") {
+      
         return json(
           {
             ok: true,
