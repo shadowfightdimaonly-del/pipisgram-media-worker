@@ -716,8 +716,20 @@ async function dinoCashOut(request, env, corsHeaders) {
   }
 
   const jumps = Number(payload.jumps);
+  const date = String(payload.date || "");
 
-  if (!Number.isInteger(jumps) || jumps <= 0 || jumps > 10000) {
+  if (!isReasonableClientDate(date)) {
+    return json(
+      {
+        ok: false,
+        error: "Invalid or stale Dino date",
+      },
+      400,
+      corsHeaders,
+    );
+  }
+
+  if (!Number.isInteger(jumps) || jumps <= 0 || jumps > 1000) {
     return json(
       {
         ok: false,
@@ -742,33 +754,64 @@ async function dinoCashOut(request, env, corsHeaders) {
   }
 
   const accessToken = await getFirestoreAccessToken(env);
+  const gameDocId = uid + "_dino_" + date;
+  const gameName = firestoreDocumentName(env, "gameStats", gameDocId);
   const userName = firestoreDocumentName(env, "users", uid);
 
-  let stars = 0;
+  let acceptedJumps = 0;
+  let awardedStars = 0;
 
   await runFirestoreTransaction(
     env,
     accessToken,
-    [userName],
+    [gameName, userName],
     (found) => {
+      const game = found.find((document) => document.name === gameName);
       const user = found.find((document) => document.name === userName);
+
       if (!user) {
         throw new HttpError(500, "User document not found");
       }
+
+      const cashedOutJumps = Math.max(
+        0,
+        Math.min(1000, readFirestoreInt(game, "cashedOutJumps")),
+      );
+
+      acceptedJumps = Math.min(jumps, 1000 - cashedOutJumps);
+      if (acceptedJumps <= 0) {
+        awardedStars = 0;
+        return [];
+      }
+
+      awardedStars = Math.floor(acceptedJumps / 2);
 
       const currentStars = Math.max(
         0,
         readFirestoreInt(user, "shadowStars"),
       );
 
-      stars = currentStars + payout;
-
-      return [
+      const writes = [
+        {
+          update: {
+            name: gameName,
+            fields: {
+              cashedOutJumps: firestoreInt(
+                cashedOutJumps + acceptedJumps,
+              ),
+            },
+          },
+          updateMask: {
+            fieldPaths: ["cashedOutJumps"],
+          },
+        },
         {
           update: {
             name: userName,
             fields: {
-              shadowStars: firestoreInt(stars),
+              shadowStars: firestoreInt(
+                currentStars + awardedStars,
+              ),
             },
           },
           updateMask: {
@@ -776,14 +819,17 @@ async function dinoCashOut(request, env, corsHeaders) {
           },
         },
       ];
+
+      return writes;
     },
   );
 
   return json(
     {
       ok: true,
-      stars: payout,
-      accepted: true,
+      accepted: acceptedJumps > 0,
+      jumps: acceptedJumps,
+      stars: awardedStars,
     },
     200,
     corsHeaders,
