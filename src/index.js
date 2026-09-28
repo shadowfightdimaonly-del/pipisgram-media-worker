@@ -79,6 +79,16 @@ export default {
         return await supportAction(request, env, corsHeaders);
       }
 
+      // POST /support/appeal
+      // Не требует Firebase ID token, потому что заблокированный
+      // пользователь не может нормально войти в аккаунт.
+      if (
+        url.pathname === "/support/appeal" &&
+        request.method === "POST"
+      ) {
+        return await supportAppeal(request, env, corsHeaders);
+      }
+
       // POST /upload
       if (url.pathname === "/upload" && request.method === "POST") {
         return await uploadFile(request, env, corsHeaders);
@@ -1414,6 +1424,153 @@ function pemToArrayBuffer(pem) {
   return bytes.buffer;
 }
 
+
+async function supportAppeal(request, env, corsHeaders) {
+  let payload = {};
+  try {
+    payload = await request.json();
+  } catch (_) {
+    payload = {};
+  }
+
+  const email = String(payload.email || "").trim().toLowerCase();
+  const message = String(payload.text || "").trim().slice(0, 3000);
+
+  if (!email || !message) {
+    throw new HttpError(400, "Email and message are required");
+  }
+
+  if (email.length > 320 || !/^\S+@\S+\.\S+$/.test(email)) {
+    throw new HttpError(400, "Invalid email");
+  }
+
+  const accessToken = await getFirestoreAccessToken(env);
+
+  const users = await firestoreRunQuery(
+    env,
+    accessToken,
+    "users",
+    "email",
+    email,
+  );
+
+  if (!users.length) {
+    throw new HttpError(404, "Аккаунт с таким email не найден");
+  }
+
+  const user = users[0];
+  const ownerUid = user.name.split("/").pop();
+
+  const permanentlyBlocked =
+    readFirestoreBool(user, "accountPermanentlyBlocked");
+  const blockedUntil = readFirestoreTimestamp(
+    user,
+    "supportBlockedUntil",
+  );
+  const currentlyBlocked =
+    permanentlyBlocked ||
+    (blockedUntil && blockedUntil.getTime() > Date.now());
+
+  if (!currentlyBlocked) {
+    throw new HttpError(
+      400,
+      "Аккаунт сейчас не заблокирован",
+    );
+  }
+
+  const existingTickets = await firestoreRunQuery(
+    env,
+    accessToken,
+    "tickets",
+    "ownerUid",
+    ownerUid,
+  );
+
+  const hasOpenAppeal = existingTickets.some((ticket) => {
+    const fields = ticket.fields || {};
+    return (
+      fields.type?.stringValue === "block_appeal" &&
+      fields.status?.stringValue === "open"
+    );
+  });
+
+  if (hasOpenAppeal) {
+    throw new HttpError(
+      409,
+      "У тебя уже есть открытая апелляция",
+    );
+  }
+
+  const ticketId = crypto.randomUUID();
+  const messageId = crypto.randomUUID();
+  const ticketName = firestoreDocumentName(
+    env,
+    "tickets",
+    ticketId,
+  );
+  const messageName = firestoreDocumentName(
+    env,
+    "tickets/" + ticketId + "/messages",
+    messageId,
+  );
+  const now = new Date().toISOString();
+
+  const reason =
+    user.fields?.supportBlockReason?.stringValue ||
+    "Причина не указана";
+
+  const blockType = permanentlyBlocked
+    ? "permanent"
+    : "temporary";
+
+  await firestoreRequest(
+    env,
+    accessToken,
+    ":commit",
+    "POST",
+    {
+      writes: [
+        {
+          update: {
+            name: ticketName,
+            fields: {
+              ownerUid: { stringValue: ownerUid },
+              type: { stringValue: "block_appeal" },
+              subject: {
+                stringValue: "Апелляция на блокировку",
+              },
+              status: { stringValue: "open" },
+              createdAt: { timestampValue: now },
+              updatedAt: { timestampValue: now },
+              lastMessage: { stringValue: message },
+              blockType: { stringValue: blockType },
+              blockReason: { stringValue: reason },
+            },
+          },
+        },
+        {
+          update: {
+            name: messageName,
+            fields: {
+              senderUid: { stringValue: ownerUid },
+              text: { stringValue: message },
+              createdAt: { timestampValue: now },
+            },
+          },
+        },
+      ],
+    },
+  );
+
+  return json(
+    {
+      ok: true,
+      ticketId,
+    },
+    200,
+    corsHeaders,
+  );
+}
 
 async function supportAction(request, env, corsHeaders) {
   const uid = await requireFirebaseUser(request, env);
