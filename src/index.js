@@ -55,6 +55,14 @@ export default {
         return await guessNumber(request, env, corsHeaders);
       }
 
+      // POST /economy/dino/cashout
+      if (
+        url.pathname === "/economy/dino/cashout" &&
+        request.method === "POST"
+      ) {
+        return await dinoCashOut(request, env, corsHeaders);
+      }
+
       // POST /upload
       if (url.pathname === "/upload" && request.method === "POST") {
         return await uploadFile(request, env, corsHeaders);
@@ -691,6 +699,91 @@ async function guessNumber(request, env, corsHeaders) {
       secretNumber: attempts > 0 ? secretNumber : null,
       attemptsLeft,
       starsAwarded: attempts > 0 && won ? 1 : 0,
+    },
+    200,
+    corsHeaders,
+  );
+}
+
+async function dinoCashOut(request, env, corsHeaders) {
+  const uid = await requireFirebaseUser(request, env);
+
+  let payload = {};
+  try {
+    payload = await request.json();
+  } catch (_) {
+    payload = {};
+  }
+
+  const jumps = Number(payload.jumps);
+
+  if (!Number.isInteger(jumps) || jumps <= 0 || jumps > 10000) {
+    return json(
+      {
+        ok: false,
+        error: "Invalid jumps",
+      },
+      400,
+      corsHeaders,
+    );
+  }
+
+  const payout = Math.floor(jumps / 2);
+  if (payout <= 0) {
+    return json(
+      {
+        ok: true,
+        stars: 0,
+        accepted: true,
+      },
+      200,
+      corsHeaders,
+    );
+  }
+
+  const accessToken = await getFirestoreAccessToken(env);
+  const userName = firestoreDocumentName(env, "users", uid);
+
+  let stars = 0;
+
+  await runFirestoreTransaction(
+    env,
+    accessToken,
+    [userName],
+    (found) => {
+      const user = found.find((document) => document.name === userName);
+      if (!user) {
+        throw new HttpError(500, "User document not found");
+      }
+
+      const currentStars = Math.max(
+        0,
+        readFirestoreInt(user, "shadowStars"),
+      );
+
+      stars = currentStars + payout;
+
+      return [
+        {
+          update: {
+            name: userName,
+            fields: {
+              shadowStars: firestoreInt(stars),
+            },
+          },
+          updateMask: {
+            fieldPaths: ["shadowStars"],
+          },
+        },
+      ];
+    },
+  );
+
+  return json(
+    {
+      ok: true,
+      stars: payout,
+      accepted: true,
     },
     200,
     corsHeaders,
