@@ -392,7 +392,9 @@ async function clickerTap(request, env, corsHeaders) {
     gameDocId,
   );
 
-  const result = await runFirestoreTransaction(
+  let accepted = false;
+
+  await runFirestoreTransaction(
     env,
     accessToken,
     [gameName],
@@ -405,6 +407,8 @@ async function clickerTap(request, env, corsHeaders) {
       if (current >= 1000) {
         return [];
       }
+
+      accepted = true;
 
       return [
         {
@@ -422,15 +426,10 @@ async function clickerTap(request, env, corsHeaders) {
     },
   );
 
-  const taps =
-    result === null
-      ? 0
-      : 1;
-
   return json(
     {
       ok: true,
-      accepted: taps === 1,
+      accepted,
     },
     200,
     corsHeaders,
@@ -561,7 +560,7 @@ async function clickerCashOut(request, env, corsHeaders) {
 }
 
 function isReasonableClientDate(value) {
-  if (!/^\\d{4}-\\d{1,2}-\\d{1,2}$/.test(value)) {
+  if (!/^\d{4}-\d{1,2}-\d{1,2}$/.test(value)) {
     return false;
   }
 
@@ -611,8 +610,8 @@ function base64UrlBytes(bytes) {
   }
 
   return btoa(binary)
-    .replace(/\\+/g, "-")
-    .replace(/\\//g, "_")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
     .replace(/=+$/g, "");
 }
 
@@ -626,7 +625,7 @@ function pemToArrayBuffer(pem) {
   const base64 = pem
     .replace(/-----BEGIN PRIVATE KEY-----/g, "")
     .replace(/-----END PRIVATE KEY-----/g, "")
-    .replace(/\\s/g, "");
+    .replace(/\s/g, "");
 
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
