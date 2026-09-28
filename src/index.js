@@ -71,6 +71,14 @@ export default {
         return await economyAction(request, env, corsHeaders);
       }
 
+      // POST /support/action
+      if (
+        url.pathname === "/support/action" &&
+        request.method === "POST"
+      ) {
+        return await supportAction(request, env, corsHeaders);
+      }
+
       // POST /upload
       if (url.pathname === "/upload" && request.method === "POST") {
         return await uploadFile(request, env, corsHeaders);
@@ -1404,6 +1412,366 @@ function pemToArrayBuffer(pem) {
   }
 
   return bytes.buffer;
+}
+
+
+async function supportAction(request, env, corsHeaders) {
+  const uid = await requireFirebaseUser(request, env);
+
+  let payload = {};
+  try {
+    payload = await request.json();
+  } catch (_) {
+    payload = {};
+  }
+
+  const action = String(payload.action || "");
+  const accessToken = await getFirestoreAccessToken(env);
+  const actorName = firestoreDocumentName(env, "users", uid);
+
+  const actor = await firestoreRequest(
+    env,
+    accessToken,
+    "/users/" + encodeURIComponent(uid),
+    "GET",
+  );
+
+  if (!actor) {
+    throw new HttpError(404, "User document not found");
+  }
+
+  const isAdmin = readFirestoreBool(actor, "isAdmin");
+
+  if (action === "create_ticket") {
+    const subject = String(payload.subject || "").trim().slice(0, 120);
+    const message = String(payload.text || "").trim().slice(0, 3000);
+    if (!subject || !message) {
+      throw new HttpError(400, "Subject and message are required");
+    }
+
+    const ticketId = crypto.randomUUID();
+    const messageId = crypto.randomUUID();
+    const ticketName = firestoreDocumentName(env, "tickets", ticketId);
+    const messageName = firestoreDocumentName(
+      env,
+      "tickets/" + ticketId + "/messages",
+      messageId,
+    );
+    const now = new Date().toISOString();
+
+    await firestoreRequest(
+      env,
+      accessToken,
+      ":commit",
+      "POST",
+      {
+        writes: [
+          {
+            update: {
+              name: ticketName,
+              fields: {
+                ownerUid: { stringValue: uid },
+                subject: { stringValue: subject },
+                status: { stringValue: "open" },
+                createdAt: { timestampValue: now },
+                updatedAt: { timestampValue: now },
+                lastMessage: { stringValue: message },
+              },
+            },
+          },
+          {
+            update: {
+              name: messageName,
+              fields: {
+                senderUid: { stringValue: uid },
+                text: { stringValue: message },
+                createdAt: { timestampValue: now },
+              },
+            },
+          },
+        ],
+      },
+    );
+
+    return json({ ok: true, ticketId }, 200, corsHeaders);
+  }
+
+  const ticketId = String(payload.ticketId || "");
+  if (!ticketId || !/^[A-Za-z0-9_-]{1,128}$/.test(ticketId)) {
+    throw new HttpError(400, "Invalid ticket id");
+  }
+
+  const ticketName = firestoreDocumentName(env, "tickets", ticketId);
+
+  const ticket = await firestoreRequest(
+    env,
+    accessToken,
+    "/tickets/" + encodeURIComponent(ticketId),
+    "GET",
+  );
+
+  if (!ticket) {
+    throw new HttpError(404, "Ticket not found");
+  }
+
+  const ownerUid = ticket.fields?.ownerUid?.stringValue || "";
+  if (ownerUid !== uid && !isAdmin) {
+    throw new HttpError(403, "Ticket access denied");
+  }
+
+  if (action === "send_message") {
+    const message = String(payload.text || "").trim().slice(0, 3000);
+    if (!message) throw new HttpError(400, "Message is empty");
+
+    const status = ticket.fields?.status?.stringValue || "open";
+    if (status === "closed") {
+      throw new HttpError(400, "Ticket is closed");
+    }
+
+    const messageId = crypto.randomUUID();
+    const messageName = firestoreDocumentName(
+      env,
+      "tickets/" + ticketId + "/messages",
+      messageId,
+    );
+    const now = new Date().toISOString();
+
+    await firestoreRequest(
+      env,
+      accessToken,
+      ":commit",
+      "POST",
+      {
+        writes: [
+          {
+            update: {
+              name: messageName,
+              fields: {
+                senderUid: { stringValue: uid },
+                text: { stringValue: message },
+                createdAt: { timestampValue: now },
+              },
+            },
+          },
+          {
+            update: {
+              name: ticketName,
+              fields: {
+                updatedAt: { timestampValue: now },
+                lastMessage: { stringValue: message },
+              },
+            },
+            updateMask: {
+              fieldPaths: ["updatedAt", "lastMessage"],
+            },
+          },
+        ],
+      },
+    );
+
+    return json({ ok: true }, 200, corsHeaders);
+  }
+
+  if (action === "close_ticket") {
+    const reason = String(payload.reason || "Другое").trim().slice(0, 120);
+    const now = new Date().toISOString();
+
+    await firestoreRequest(
+      env,
+      accessToken,
+      ticketName,
+      "PATCH",
+      {
+        fields: {
+          status: { stringValue: "closed" },
+          closedReason: { stringValue: reason },
+          closedBy: { stringValue: uid },
+          updatedAt: { timestampValue: now },
+        },
+      },
+    );
+
+    return json({ ok: true }, 200, corsHeaders);
+  }
+
+  if (action === "reopen_ticket") {
+    if (!isAdmin) throw new HttpError(403, "Admin access required");
+
+    const now = new Date().toISOString();
+    await firestoreRequest(
+      env,
+      accessToken,
+      ticketName,
+      "PATCH",
+      {
+        fields: {
+          status: { stringValue: "open" },
+          updatedAt: { timestampValue: now },
+        },
+        updateMask: {
+          fieldPaths: ["status", "updatedAt"],
+        },
+      },
+    );
+
+    return json({ ok: true }, 200, corsHeaders);
+  }
+
+  if (
+    action === "warn_user" ||
+    action === "block_user" ||
+    action === "unblock_user"
+  ) {
+    if (!isAdmin) throw new HttpError(403, "Admin access required");
+
+    const targetUid = String(payload.targetUid || "");
+    if (!targetUid || targetUid === uid) {
+      throw new HttpError(400, "Invalid moderation target");
+    }
+
+    const targetName = firestoreDocumentName(env, "users", targetUid);
+    const target = await firestoreRequest(
+      env,
+      accessToken,
+      "/users/" + encodeURIComponent(targetUid),
+      "GET",
+    );
+
+    if (!target) throw new HttpError(404, "User not found");
+
+    const reason = String(payload.reason || "Нарушение правил")
+      .trim()
+      .slice(0, 500);
+
+    if (action === "unblock_user") {
+      await firestoreRequest(
+        env,
+        accessToken,
+        targetName,
+        "PATCH",
+        {
+          fields: {
+            supportBlockedUntil: { nullValue: null },
+            supportBlockReason: { nullValue: null },
+            accountPermanentlyBlocked: { booleanValue: false },
+          },
+          updateMask: {
+            fieldPaths: [
+              "supportBlockedUntil",
+              "supportBlockReason",
+              "accountPermanentlyBlocked",
+            ],
+          },
+        },
+      );
+
+      return json({ ok: true }, 200, corsHeaders);
+    }
+
+    if (action === "warn_user") {
+      const currentWarnings = Math.max(
+        0,
+        readFirestoreInt(target, "supportWarnings"),
+      );
+      const warnings = currentWarnings + 1;
+      const fields = {
+        supportWarnings: firestoreInt(warnings),
+        lastSupportWarning: {
+          timestampValue: new Date().toISOString(),
+        },
+        supportBlockReason: { stringValue: reason },
+      };
+
+      if (warnings >= 3) {
+        const until = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        fields.supportBlockedUntil = {
+          timestampValue: until.toISOString(),
+        };
+      }
+
+      await firestoreRequest(
+        env,
+        accessToken,
+        targetName,
+        "PATCH",
+        { fields },
+      );
+
+      return json(
+        {
+          ok: true,
+          warnings,
+          autoBlocked: warnings >= 3,
+        },
+        200,
+        corsHeaders,
+      );
+    }
+
+    const mode = String(payload.mode || "temporary");
+    if (mode === "permanent") {
+      await firestoreRequest(
+        env,
+        accessToken,
+        targetName,
+        "PATCH",
+        {
+          fields: {
+            accountPermanentlyBlocked: { booleanValue: true },
+            supportBlockedUntil: { nullValue: null },
+            supportBlockReason: { stringValue: reason },
+          },
+          updateMask: {
+            fieldPaths: [
+              "accountPermanentlyBlocked",
+              "supportBlockedUntil",
+              "supportBlockReason",
+            ],
+          },
+        },
+      );
+      return json({ ok: true, permanent: true }, 200, corsHeaders);
+    }
+
+    let hours = Number(payload.hours);
+    if (!Number.isInteger(hours) || hours < 1 || hours > 720) {
+      hours = 24;
+    }
+
+    const until = new Date(Date.now() + hours * 60 * 60 * 1000);
+    await firestoreRequest(
+      env,
+      accessToken,
+      targetName,
+      "PATCH",
+      {
+        fields: {
+          supportBlockedUntil: { timestampValue: until.toISOString() },
+          supportBlockReason: { stringValue: reason },
+          accountPermanentlyBlocked: { booleanValue: false },
+        },
+        updateMask: {
+          fieldPaths: [
+            "supportBlockedUntil",
+            "supportBlockReason",
+            "accountPermanentlyBlocked",
+          ],
+        },
+      },
+    );
+
+    return json(
+      {
+        ok: true,
+        permanent: false,
+        hours,
+      },
+      200,
+      corsHeaders,
+    );
+  }
+
+  throw new HttpError(400, "Unknown support action");
 }
 
 async function uploadFile(request, env, corsHeaders) {
