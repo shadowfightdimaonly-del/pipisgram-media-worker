@@ -1588,6 +1588,9 @@ async function supportAction(request, env, corsHeaders) {
           closedBy: { stringValue: uid },
           updatedAt: { timestampValue: now },
         },
+        updateMask: {
+          fieldPaths: ["status", "closedReason", "closedBy", "updatedAt"],
+        },
       },
     );
 
@@ -1694,7 +1697,17 @@ async function supportAction(request, env, corsHeaders) {
         accessToken,
         targetName,
         "PATCH",
-        { fields },
+        {
+          fields,
+          updateMask: {
+            fieldPaths: [
+              "supportWarnings",
+              "lastSupportWarning",
+              "supportBlockReason",
+              ...(warnings >= 3 ? ["supportBlockedUntil"] : []),
+            ],
+          },
+        },
       );
 
       return json(
@@ -2098,17 +2111,3 @@ async function getSignatureKey(
     kService,
     "aws4_request",
   );
-}
-
-function json(data, status, extraHeaders = {}) {
-  return new Response(
-    JSON.stringify(data, null, 2),
-    {
-      status,
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        ...extraHeaders,
-      },
-    },
-  );
-}
