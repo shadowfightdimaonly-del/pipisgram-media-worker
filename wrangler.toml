@@ -4,5 +4,6 @@ compatibility_date = "2026-09-27"
 
 [vars]
 FILEBASE_BUCKET = "pipisgram-test-2026"
+FIREBASE_PROJECT_ID = "pipisgram-afc20"
 FILEBASE_ENDPOINT = "https://s3.filebase.io"
 FILEBASE_REGION = "auto"
