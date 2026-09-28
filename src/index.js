@@ -1064,23 +1064,37 @@ async function economyAction(request, env, corsHeaders) {
           const stars = Math.max(0, readFirestoreInt(user, "shadowStars"));
           if (stars < gift.price) throw new HttpError(400, "Not enough stars");
 
-          const writes = [{
-            update: {
-              name: userName,
-              fields: { shadowStars: firestoreInt(stars - gift.price) },
-            },
-            updateMask: { fieldPaths: ["shadowStars"] },
-          }];
+          if (recipientUid === uid) {
+            return [{
+              update: {
+                name: userName,
+                fields: {
+                  shadowStars: firestoreInt(stars - gift.price),
+                  [gift.field]: { booleanValue: true },
+                },
+              },
+              updateMask: {
+                fieldPaths: ["shadowStars", gift.field],
+              },
+            }];
+          }
 
-          writes.push({
-            update: {
-              name: recipientName,
-              fields: { [gift.field]: { booleanValue: true } },
+          return [
+            {
+              update: {
+                name: userName,
+                fields: { shadowStars: firestoreInt(stars - gift.price) },
+              },
+              updateMask: { fieldPaths: ["shadowStars"] },
             },
-            updateMask: { fieldPaths: [gift.field] },
-          });
-
-          return writes;
+            {
+              update: {
+                name: recipientName,
+                fields: { [gift.field]: { booleanValue: true } },
+              },
+              updateMask: { fieldPaths: [gift.field] },
+            },
+          ];
         },
       );
 
