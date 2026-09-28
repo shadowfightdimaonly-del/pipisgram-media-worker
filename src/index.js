@@ -1228,6 +1228,16 @@ async function economyAction(request, env, corsHeaders) {
       },
     );
 
+    await writeModerationLog(
+      env,
+      accessToken,
+      uid,
+      "penalty",
+      targetUid,
+      reason,
+      { amount },
+    );
+
     return json({ ok: true, starsRemoved: amount }, 200, corsHeaders);
   }
 
