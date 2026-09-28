@@ -79,6 +79,14 @@ export default {
         return await supportAction(request, env, corsHeaders);
       }
 
+      // POST /admin/action
+      if (
+        url.pathname === "/admin/action" &&
+        request.method === "POST"
+      ) {
+        return await adminAction(request, env, corsHeaders);
+      }
+
       // POST /support/appeal
       // Не требует Firebase ID token, потому что заблокированный
       // пользователь не может нормально войти в аккаунт.
@@ -1425,6 +1433,124 @@ function pemToArrayBuffer(pem) {
 }
 
 
+
+async function adminAction(request, env, corsHeaders) {
+  const uid = await requireFirebaseUser(request, env);
+
+  let payload = {};
+  try {
+    payload = await request.json();
+  } catch (_) {
+    payload = {};
+  }
+
+  const action = String(payload.action || "");
+  const accessToken = await getFirestoreAccessToken(env);
+  const actorName = firestoreDocumentName(env, "users", uid);
+  const actor = await firestoreRequest(
+    env,
+    accessToken,
+    "/users/" + encodeURIComponent(uid),
+    "GET",
+  );
+
+  if (!actor || !readFirestoreBool(actor, "isAdmin")) {
+    throw new HttpError(403, "Admin access required");
+  }
+
+  if (action === "search_users") {
+    const query = String(payload.query || "").trim().slice(0, 120);
+    if (!query) throw new HttpError(400, "Search query is required");
+
+    const fields = ["userCode", "username", "email"];
+    const found = [];
+    const seen = new Set();
+
+    for (const field of fields) {
+      const docs = await firestoreRunQuery(
+        env,
+        accessToken,
+        "users",
+        field,
+        query,
+      );
+
+      for (const doc of docs) {
+        if (seen.has(doc.name)) continue;
+        seen.add(doc.name);
+        found.push(doc);
+        if (found.length >= 20) break;
+      }
+
+      if (found.length >= 20) break;
+    }
+
+    const users = found.slice(0, 20).map((doc) => {
+      const fields = doc.fields || {};
+      const userUid = doc.name.split("/").pop();
+      const blockedUntil = readFirestoreTimestamp(
+        doc,
+        "supportBlockedUntil",
+      );
+
+      return {
+        uid: userUid,
+        username: fields.username?.stringValue || "",
+        userCode: fields.userCode?.stringValue || "",
+        email: fields.email?.stringValue || "",
+        shadowStars: Math.max(0, readFirestoreInt(doc, "shadowStars")),
+        isPremium: readFirestoreBool(doc, "isPremium"),
+        premiumUntil: readFirestoreTimestamp(doc, "premiumUntil")?.toISOString() || null,
+        isAdmin: readFirestoreBool(doc, "isAdmin"),
+        supportWarnings: Math.max(0, readFirestoreInt(doc, "supportWarnings")),
+        permanentlyBlocked: readFirestoreBool(doc, "accountPermanentlyBlocked"),
+        blockedUntil: blockedUntil?.toISOString() || null,
+        blockReason: fields.supportBlockReason?.stringValue || "",
+        online: readFirestoreBool(doc, "online"),
+      };
+    });
+
+    return json({ ok: true, users }, 200, corsHeaders);
+  }
+
+  if (action === "get_user") {
+    const targetUid = String(payload.targetUid || "").trim();
+    if (!targetUid) throw new HttpError(400, "Missing targetUid");
+
+    const doc = await firestoreRequest(
+      env,
+      accessToken,
+      "/users/" + encodeURIComponent(targetUid),
+      "GET",
+    );
+    if (!doc) throw new HttpError(404, "User not found");
+
+    const fields = doc.fields || {};
+    const blockedUntil = readFirestoreTimestamp(doc, "supportBlockedUntil");
+
+    return json({
+      ok: true,
+      user: {
+        uid: targetUid,
+        username: fields.username?.stringValue || "",
+        userCode: fields.userCode?.stringValue || "",
+        email: fields.email?.stringValue || "",
+        shadowStars: Math.max(0, readFirestoreInt(doc, "shadowStars")),
+        isPremium: readFirestoreBool(doc, "isPremium"),
+        premiumUntil: readFirestoreTimestamp(doc, "premiumUntil")?.toISOString() || null,
+        isAdmin: readFirestoreBool(doc, "isAdmin"),
+        supportWarnings: Math.max(0, readFirestoreInt(doc, "supportWarnings")),
+        permanentlyBlocked: readFirestoreBool(doc, "accountPermanentlyBlocked"),
+        blockedUntil: blockedUntil?.toISOString() || null,
+        blockReason: fields.supportBlockReason?.stringValue || "",
+        online: readFirestoreBool(doc, "online"),
+      },
+    }, 200, corsHeaders);
+  }
+
+  throw new HttpError(400, "Unknown admin action");
+}
+
 async function supportAppeal(request, env, corsHeaders) {
   let payload = {};
   try {
@@ -1825,6 +1951,8 @@ async function supportAction(request, env, corsHeaders) {
         },
       );
 
+      await writeModerationLog(env, accessToken, uid, "unblock_user", targetUid, "Снятие блокировки");
+
       return json({ ok: true }, 200, corsHeaders);
     }
 
@@ -1842,12 +1970,6 @@ async function supportAction(request, env, corsHeaders) {
         supportBlockReason: { stringValue: reason },
       };
 
-      if (warnings >= 3) {
-        const until = new Date(Date.now() + 24 * 60 * 60 * 1000);
-        fields.supportBlockedUntil = {
-          timestampValue: until.toISOString(),
-        };
-      }
 
       await firestoreRequest(
         env,
@@ -1861,17 +1983,26 @@ async function supportAction(request, env, corsHeaders) {
               "supportWarnings",
               "lastSupportWarning",
               "supportBlockReason",
-              ...(warnings >= 3 ? ["supportBlockedUntil"] : []),
             ],
           },
         },
+      );
+
+      await writeModerationLog(
+        env,
+        accessToken,
+        uid,
+        "warn_user",
+        targetUid,
+        reason,
+        { warnings },
       );
 
       return json(
         {
           ok: true,
           warnings,
-          autoBlocked: warnings >= 3,
+          autoBlocked: false,
         },
         200,
         corsHeaders,
@@ -1900,6 +2031,7 @@ async function supportAction(request, env, corsHeaders) {
           },
         },
       );
+      await writeModerationLog(env, accessToken, uid, "block_permanent", targetUid, reason);
       return json({ ok: true, permanent: true }, 200, corsHeaders);
     }
 
@@ -1930,6 +2062,8 @@ async function supportAction(request, env, corsHeaders) {
       },
     );
 
+    await writeModerationLog(env, accessToken, uid, "block_temporary", targetUid, reason, { hours });
+
     return json(
       {
         ok: true,
@@ -1942,6 +2076,54 @@ async function supportAction(request, env, corsHeaders) {
   }
 
   throw new HttpError(400, "Unknown support action");
+}
+
+
+async function writeModerationLog(
+  env,
+  accessToken,
+  adminUid,
+  action,
+  targetUid,
+  reason,
+  extraFields = {},
+) {
+  const fields = {
+    adminUid: { stringValue: adminUid },
+    action: { stringValue: action },
+    targetUid: { stringValue: targetUid },
+    reason: { stringValue: String(reason || "").slice(0, 500) },
+    createdAt: { timestampValue: new Date().toISOString() },
+  };
+
+  for (const [key, value] of Object.entries(extraFields)) {
+    if (typeof value === "number" && Number.isInteger(value)) {
+      fields[key] = firestoreInt(value);
+    } else {
+      fields[key] = { stringValue: String(value) };
+    }
+  }
+
+  await firestoreRequest(
+    env,
+    accessToken,
+    ":commit",
+    "POST",
+    {
+      writes: [
+        {
+          update: {
+            name: firestoreDocumentName(
+              env,
+              "moderationLogs",
+              crypto.randomUUID(),
+            ),
+            fields,
+          },
+        },
+      ],
+    },
+  );
 }
 
 async function uploadFile(request, env, corsHeaders) {
