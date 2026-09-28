@@ -47,6 +47,14 @@ export default {
         return await clickerCashOut(request, env, corsHeaders);
       }
 
+      // POST /economy/guess
+      if (
+        url.pathname === "/economy/guess" &&
+        request.method === "POST"
+      ) {
+        return await guessNumber(request, env, corsHeaders);
+      }
+
       // POST /upload
       if (url.pathname === "/upload" && request.method === "POST") {
         return await uploadFile(request, env, corsHeaders);
@@ -557,6 +565,132 @@ async function clickerCashOut(request, env, corsHeaders) {
       ok: true,
       stars: payout,
       remainingTaps,
+    },
+    200,
+    corsHeaders,
+  );
+}
+
+async function guessNumber(request, env, corsHeaders) {
+  const uid = await requireFirebaseUser(request, env);
+
+  let payload = {};
+  try {
+    payload = await request.json();
+  } catch (_) {
+    payload = {};
+  }
+
+  const date = String(payload.date || "");
+  const number = Number(payload.number);
+
+  if (!isReasonableClientDate(date)) {
+    return json(
+      {
+        ok: false,
+        error: "Invalid or stale guess date",
+      },
+      400,
+      corsHeaders,
+    );
+  }
+
+  if (!Number.isInteger(number) || number < 1 || number > 15) {
+    return json(
+      {
+        ok: false,
+        error: "Guess must be an integer from 1 to 15",
+      },
+      400,
+      corsHeaders,
+    );
+  }
+
+  const accessToken = await getFirestoreAccessToken(env);
+  const gameDocId = uid + "_guess_" + date;
+  const gameName = firestoreDocumentName(env, "gameStats", gameDocId);
+  const userName = firestoreDocumentName(env, "users", uid);
+
+  // Секрет генерируется на сервере, а не в APK.
+  const random = new Uint32Array(1);
+  crypto.getRandomValues(random);
+  const secretNumber = (random[0] % 15) + 1;
+  const won = number === secretNumber;
+
+  let attempts = 0;
+  let attemptsLeft = 0;
+
+  const result = await runFirestoreTransaction(
+    env,
+    accessToken,
+    [gameName, userName],
+    (found) => {
+      const game = found.find((document) => document.name === gameName);
+      const user = found.find((document) => document.name === userName);
+
+      const used = Math.max(
+        0,
+        Math.min(3, readFirestoreInt(game, "attempts")),
+      );
+
+      if (used >= 3) {
+        attempts = used;
+        attemptsLeft = 0;
+        return [];
+      }
+
+      if (won && !user) {
+        throw new HttpError(500, "User document not found");
+      }
+
+      attempts = used + 1;
+      attemptsLeft = 3 - attempts;
+
+      const writes = [
+        {
+          update: {
+            name: gameName,
+            fields: {
+              attempts: firestoreInt(attempts),
+            },
+          },
+          updateMask: {
+            fieldPaths: ["attempts"],
+          },
+        },
+      ];
+
+      if (won) {
+        const stars = Math.max(
+          0,
+          readFirestoreInt(user, "shadowStars"),
+        );
+
+        writes.push({
+          update: {
+            name: userName,
+            fields: {
+              shadowStars: firestoreInt(stars + 1),
+            },
+          },
+          updateMask: {
+            fieldPaths: ["shadowStars"],
+          },
+        });
+      }
+
+      return writes;
+    },
+  );
+
+  return json(
+    {
+      ok: true,
+      accepted: attempts > 0,
+      won: attempts > 0 && won,
+      secretNumber: attempts > 0 ? secretNumber : null,
+      attemptsLeft,
+      starsAwarded: attempts > 0 && won ? 1 : 0,
     },
     200,
     corsHeaders,
