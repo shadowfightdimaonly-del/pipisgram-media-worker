@@ -5,7 +5,7 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": ALLOWED_ORIGINS,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
     };
 
     if (request.method === "OPTIONS") {
@@ -393,6 +393,7 @@ async function clickerTap(request, env, corsHeaders) {
   );
 
   let accepted = false;
+  let taps = 0;
 
   await runFirestoreTransaction(
     env,
@@ -404,11 +405,13 @@ async function clickerTap(request, env, corsHeaders) {
       );
 
       const current = readFirestoreInt(game, "taps");
+      taps = current;
       if (current >= 1000) {
         return [];
       }
 
       accepted = true;
+      taps = current + 1;
 
       return [
         {
@@ -430,6 +433,7 @@ async function clickerTap(request, env, corsHeaders) {
     {
       ok: true,
       accepted,
+      taps,
     },
     200,
     corsHeaders,
