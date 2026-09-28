@@ -1469,31 +1469,50 @@ async function adminAction(request, env, corsHeaders) {
   }
 
   if (action === "search_users") {
-    const query = String(payload.query || "").trim().slice(0, 120);
+    let query = String(payload.query || "").trim().slice(0, 120);
     if (!query) throw new HttpError(400, "Search query is required");
 
-    const fields = ["userCode", "username", "email"];
-    const found = [];
-    const seen = new Set();
+    const candidates = new Map();
+    const normalized = query.replace(/^[@#]/, "").trim();
 
-    for (const field of fields) {
+    const searchValues = [
+      ["userCode", normalized],
+      ["username", normalized],
+      ["email", normalized.toLowerCase()],
+    ];
+
+    for (const [field, value] of searchValues) {
+      if (!value) continue;
       const docs = await firestoreRunQuery(
         env,
         accessToken,
         "users",
         field,
-        query,
+        value,
       );
 
       for (const doc of docs) {
-        if (seen.has(doc.name)) continue;
-        seen.add(doc.name);
-        found.push(doc);
-        if (found.length >= 20) break;
+        candidates.set(doc.name, doc);
+        if (candidates.size >= 20) break;
       }
 
-      if (found.length >= 20) break;
+      if (candidates.size >= 20) break;
     }
+
+    // UID не является полем документа, поэтому проверяем его напрямую.
+    if (candidates.size === 0 && /^[A-Za-z0-9_-]{10,128}$/.test(normalized)) {
+      try {
+        const doc = await firestoreRequest(
+          env,
+          accessToken,
+          "/users/" + encodeURIComponent(normalized),
+          "GET",
+        );
+        if (doc) candidates.set(doc.name, doc);
+      } catch (_) {}
+    }
+
+    const found = [...candidates.values()];
 
     const users = found.slice(0, 20).map((doc) => {
       const fields = doc.fields || {};
@@ -1521,6 +1540,46 @@ async function adminAction(request, env, corsHeaders) {
     });
 
     return json({ ok: true, users }, 200, corsHeaders);
+  }
+
+  if (action === "list_tickets") {
+    const result = await firestoreRequest(
+      env,
+      accessToken,
+      ":runQuery",
+      "POST",
+      {
+        structuredQuery: {
+          from: [{ collectionId: "tickets" }],
+          orderBy: [
+            {
+              field: { fieldPath: "updatedAt" },
+              direction: "DESCENDING",
+            },
+          ],
+          limit: 100,
+        },
+      },
+    );
+
+    const tickets = (Array.isArray(result) ? result : [])
+      .filter((item) => item.document)
+      .map((item) => {
+        const fields = item.document.fields || {};
+        return {
+          id: item.document.name.split("/").pop(),
+          ownerUid: fields.ownerUid?.stringValue || "",
+          type: fields.type?.stringValue || "ticket",
+          subject: fields.subject?.stringValue || "Без темы",
+          status: fields.status?.stringValue || "open",
+          lastMessage: fields.lastMessage?.stringValue || "",
+          blockType: fields.blockType?.stringValue || "",
+          blockReason: fields.blockReason?.stringValue || "",
+          updatedAt: fields.updatedAt?.timestampValue || null,
+        };
+      });
+
+    return json({ ok: true, tickets }, 200, corsHeaders);
   }
 
   if (action === "get_user") {
