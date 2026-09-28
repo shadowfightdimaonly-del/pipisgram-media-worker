@@ -535,6 +535,11 @@ async function clickerCashOut(request, env, corsHeaders) {
         (payout * 10) / 3,
       );
 
+      if (tapsToCashOut <= 0) {
+        remainingTaps = availableTaps;
+        return [];
+      }
+
       const stars = Math.max(
         0,
         readFirestoreInt(user, "shadowStars"),
@@ -1063,8 +1068,14 @@ async function economyAction(request, env, corsHeaders) {
           const recipient = found.find((document) => document.name === recipientName);
           if (!user || !recipient) throw new HttpError(404, "User not found");
 
-          if (gift.requiresPremium && !readFirestoreBool(user, "isPremium")) {
-            throw new HttpError(400, "Premium required");
+          if (gift.requiresPremium) {
+            const premiumUntil = readFirestoreTimestamp(user, "premiumUntil");
+            const premiumActive =
+              readFirestoreBool(user, "isPremium") ||
+              (premiumUntil && premiumUntil > new Date());
+            if (!premiumActive) {
+              throw new HttpError(400, "Premium required");
+            }
           }
 
           const stars = Math.max(0, readFirestoreInt(user, "shadowStars"));
@@ -1160,7 +1171,7 @@ async function economyAction(request, env, corsHeaders) {
           {
             update: {
               name: targetName,
-              fields: { shadowStars: firestoreInt(targetStars - amount) },
+              fields: { shadowStars: firestoreInt(Math.max(0, targetStars - amount)) },
             },
             updateMask: { fieldPaths: ["shadowStars"] },
           },
@@ -1347,7 +1358,7 @@ function isReasonableClientDate(value) {
   );
   const supplied = date.getTime();
 
-  return Math.abs(today - supplied) <= 86400000;
+  return supplied === today;
 }
 
 class HttpError extends Error {
