@@ -966,7 +966,13 @@ async function economyAction(request, env, corsHeaders) {
           if (!user) throw new HttpError(404, "User document not found");
 
           const fields = user.fields || {};
-          if (readFirestoreBool(user, "isPremium")) {
+          if (
+            readFirestoreBool(user, "isPremium") ||
+            (() => {
+              const expiry = readFirestoreTimestamp(user, "premiumUntil");
+              return expiry && expiry > new Date();
+            })()
+          ) {
             throw new HttpError(400, "Premium already active");
           }
 
