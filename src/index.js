@@ -63,6 +63,14 @@ export default {
         return await dinoCashOut(request, env, corsHeaders);
       }
 
+      // POST /economy/action
+      if (
+        url.pathname === "/economy/action" &&
+        request.method === "POST"
+      ) {
+        return await economyAction(request, env, corsHeaders);
+      }
+
       // POST /upload
       if (url.pathname === "/upload" && request.method === "POST") {
         return await uploadFile(request, env, corsHeaders);
@@ -834,6 +842,459 @@ async function dinoCashOut(request, env, corsHeaders) {
     200,
     corsHeaders,
   );
+}
+
+async function economyAction(request, env, corsHeaders) {
+  const uid = await requireFirebaseUser(request, env);
+
+  let payload = {};
+  try {
+    payload = await request.json();
+  } catch (_) {
+    payload = {};
+  }
+
+  const action = String(payload.action || "");
+  const amount = Number(payload.amount);
+  const targetUid = String(payload.targetUid || "");
+
+  if (!action) {
+    throw new HttpError(400, "Missing economy action");
+  }
+
+  if (action === "admin_star") {
+    if (!Number.isInteger(amount) || amount < 1 || amount > 1000) {
+      throw new HttpError(400, "Amount must be from 1 to 1000");
+    }
+
+    const accessToken = await getFirestoreAccessToken(env);
+    const userName = firestoreDocumentName(env, "users", uid);
+
+    await runFirestoreTransaction(
+      env,
+      accessToken,
+      [userName],
+      (found) => {
+        const user = found.find((document) => document.name === userName);
+        if (!user) throw new HttpError(404, "User document not found");
+        if (!readFirestoreBool(user, "isAdmin")) {
+          throw new HttpError(403, "Admin access required");
+        }
+
+        const stars = Math.max(0, readFirestoreInt(user, "shadowStars"));
+        return [{
+          update: {
+            name: userName,
+            fields: {
+              shadowStars: firestoreInt(stars + amount),
+            },
+          },
+          updateMask: { fieldPaths: ["shadowStars"] },
+        }];
+      },
+    );
+
+    return json({ ok: true, starsAdded: amount }, 200, corsHeaders);
+  }
+
+  if (
+    action === "transfer" ||
+    action === "buy_premium" ||
+    action === "give_premium" ||
+    action === "buy_gift" ||
+    action === "gift"
+  ) {
+    const accessToken = await getFirestoreAccessToken(env);
+    const userName = firestoreDocumentName(env, "users", uid);
+
+    if (action === "transfer") {
+      if (!Number.isInteger(amount) || amount <= 0 || amount > 1000000) {
+        throw new HttpError(400, "Invalid amount");
+      }
+      if (!targetUid || targetUid === uid) {
+        throw new HttpError(400, "Invalid recipient");
+      }
+
+      const targetName = firestoreDocumentName(env, "users", targetUid);
+      await runFirestoreTransaction(
+        env,
+        accessToken,
+        [userName, targetName],
+        (found) => {
+          const user = found.find((document) => document.name === userName);
+          const target = found.find((document) => document.name === targetName);
+          if (!user || !target) throw new HttpError(404, "User not found");
+
+          const stars = Math.max(0, readFirestoreInt(user, "shadowStars"));
+          if (stars < amount) throw new HttpError(400, "Not enough stars");
+
+          return [
+            {
+              update: {
+                name: userName,
+                fields: { shadowStars: firestoreInt(stars - amount) },
+              },
+              updateMask: { fieldPaths: ["shadowStars"] },
+            },
+            {
+              update: {
+                name: targetName,
+                fields: {
+                  shadowStars: firestoreInt(
+                    Math.max(0, readFirestoreInt(target, "shadowStars")) + amount,
+                  ),
+                },
+              },
+              updateMask: { fieldPaths: ["shadowStars"] },
+            },
+          ];
+        },
+      );
+
+      return json({ ok: true, starsTransferred: amount }, 200, corsHeaders);
+    }
+
+    if (action === "buy_premium") {
+      const price = 750;
+
+      await runFirestoreTransaction(
+        env,
+        accessToken,
+        [userName],
+        (found) => {
+          const user = found.find((document) => document.name === userName);
+          if (!user) throw new HttpError(404, "User document not found");
+
+          const fields = user.fields || {};
+          if (readFirestoreBool(user, "isPremium")) {
+            throw new HttpError(400, "Premium already active");
+          }
+
+          const stars = Math.max(0, readFirestoreInt(user, "shadowStars"));
+          if (stars < price) throw new HttpError(400, "Not enough stars");
+
+          return [{
+            update: {
+              name: userName,
+              fields: {
+                shadowStars: firestoreInt(stars - price),
+                isPremium: { booleanValue: true },
+              },
+            },
+            updateMask: { fieldPaths: ["shadowStars", "isPremium"] },
+          }];
+        },
+      );
+
+      return json({ ok: true, price }, 200, corsHeaders);
+    }
+
+    if (action === "give_premium") {
+      const price = 750;
+      if (!targetUid || targetUid === uid) {
+        throw new HttpError(400, "Invalid premium recipient");
+      }
+
+      const targetName = firestoreDocumentName(env, "users", targetUid);
+      await runFirestoreTransaction(
+        env,
+        accessToken,
+        [userName, targetName],
+        (found) => {
+          const user = found.find((document) => document.name === userName);
+          const target = found.find((document) => document.name === targetName);
+          if (!user || !target) throw new HttpError(404, "User not found");
+
+          const stars = Math.max(0, readFirestoreInt(user, "shadowStars"));
+          if (stars < price) throw new HttpError(400, "Not enough stars");
+
+          return [
+            {
+              update: {
+                name: userName,
+                fields: { shadowStars: firestoreInt(stars - price) },
+              },
+              updateMask: { fieldPaths: ["shadowStars"] },
+            },
+            {
+              update: {
+                name: targetName,
+                fields: { isPremium: { booleanValue: true } },
+              },
+              updateMask: { fieldPaths: ["isPremium"] },
+            },
+          ];
+        },
+      );
+
+      return json({ ok: true, price }, 200, corsHeaders);
+    }
+
+    if (action === "buy_gift" || action === "gift") {
+      const giftId = String(payload.giftId || "");
+      const gifts = {
+        "1": { price: 120, field: "hasGiftEditMessages", requiresPremium: false },
+        "2": { price: 215, field: "hasGiftChangeAvatars", requiresPremium: false },
+        "3": { price: 570, field: "hasGiftGroupTakeover", requiresPremium: true },
+      };
+      const gift = gifts[giftId];
+      if (!gift) throw new HttpError(400, "Invalid gift");
+
+      const recipientUid = action === "buy_gift" ? uid : targetUid;
+      if (!recipientUid) throw new HttpError(400, "Missing gift recipient");
+
+      const recipientName = firestoreDocumentName(env, "users", recipientUid);
+      const docs = recipientUid === uid
+        ? [userName]
+        : [userName, recipientName];
+
+      await runFirestoreTransaction(
+        env,
+        accessToken,
+        docs,
+        (found) => {
+          const user = found.find((document) => document.name === userName);
+          const recipient = found.find((document) => document.name === recipientName);
+          if (!user || !recipient) throw new HttpError(404, "User not found");
+
+          if (gift.requiresPremium && !readFirestoreBool(user, "isPremium")) {
+            throw new HttpError(400, "Premium required");
+          }
+
+          const stars = Math.max(0, readFirestoreInt(user, "shadowStars"));
+          if (stars < gift.price) throw new HttpError(400, "Not enough stars");
+
+          const writes = [{
+            update: {
+              name: userName,
+              fields: { shadowStars: firestoreInt(stars - gift.price) },
+            },
+            updateMask: { fieldPaths: ["shadowStars"] },
+          }];
+
+          writes.push({
+            update: {
+              name: recipientName,
+              fields: { [gift.field]: { booleanValue: true } },
+            },
+            updateMask: { fieldPaths: [gift.field] },
+          });
+
+          return writes;
+        },
+      );
+
+      return json({ ok: true, price: gift.price, giftId }, 200, corsHeaders);
+    }
+  }
+
+  if (action === "penalty") {
+    if (!Number.isInteger(amount) || amount <= 0 || amount > 1000000) {
+      throw new HttpError(400, "Invalid penalty amount");
+    }
+    if (!targetUid || targetUid === uid) {
+      throw new HttpError(400, "Invalid penalty target");
+    }
+
+    const accessToken = await getFirestoreAccessToken(env);
+    const adminName = firestoreDocumentName(env, "users", uid);
+    const targetName = firestoreDocumentName(env, "users", targetUid);
+
+    const ownerQuery = await firestoreRunQuery(
+      env,
+      accessToken,
+      "users",
+      "userCode",
+      "80930",
+    );
+    const ownerDoc = ownerQuery[0];
+    if (!ownerDoc) throw new HttpError(404, "Support owner not found");
+
+    const ownerName = ownerDoc.name;
+    if (ownerName === targetName) {
+      throw new HttpError(400, "Cannot penalize owner");
+    }
+
+    const reason = String(payload.reason || "нарушение правил").slice(0, 500);
+
+    await runFirestoreTransaction(
+      env,
+      accessToken,
+      [adminName, targetName, ownerName],
+      (found) => {
+        const admin = found.find((document) => document.name === adminName);
+        const target = found.find((document) => document.name === targetName);
+        const owner = found.find((document) => document.name === ownerName);
+
+        if (!admin || !target || !owner) {
+          throw new HttpError(404, "User not found");
+        }
+        if (!readFirestoreBool(admin, "isAdmin")) {
+          throw new HttpError(403, "Admin access required");
+        }
+
+        const targetStars = Math.max(0, readFirestoreInt(target, "shadowStars"));
+        const ownerStars = Math.max(0, readFirestoreInt(owner, "shadowStars"));
+
+        return [
+          {
+            update: {
+              name: targetName,
+              fields: { shadowStars: firestoreInt(targetStars - amount) },
+            },
+            updateMask: { fieldPaths: ["shadowStars"] },
+          },
+          {
+            update: {
+              name: ownerName,
+              fields: { shadowStars: firestoreInt(ownerStars + amount) },
+            },
+            updateMask: { fieldPaths: ["shadowStars"] },
+          },
+          {
+            update: {
+              name: firestoreDocumentName(
+                env,
+                "penalties",
+                crypto.randomUUID(),
+              ),
+              fields: {
+                targetUid: { stringValue: targetUid },
+                amount: firestoreInt(amount),
+                reason: { stringValue: reason },
+                adminUid: { stringValue: uid },
+                createdAt: { timestampValue: new Date().toISOString() },
+              },
+            },
+          },
+        ];
+      },
+    );
+
+    return json({ ok: true, starsRemoved: amount }, 200, corsHeaders);
+  }
+
+  if (action === "promo") {
+    const code = String(payload.code || "").toLowerCase();
+    const promos = {
+      "shadow_star_gift210": { type: "stars", amount: 15 },
+      "shadow_star_free700": { type: "stars", amount: 30 },
+      "shadow_star_12_13_15q": { type: "stars", amount: 50 },
+      "premium_19387": { type: "premium", days: 5 },
+    };
+    const promo = promos[code];
+    if (!promo) throw new HttpError(400, "Invalid promo code");
+
+    const accessToken = await getFirestoreAccessToken(env);
+    const userName = firestoreDocumentName(env, "users", uid);
+    const usedName = firestoreDocumentName(
+      env,
+      "usedPromoCodes",
+      uid + "_" + code,
+    );
+
+    await runFirestoreTransaction(
+      env,
+      accessToken,
+      [userName, usedName],
+      (found) => {
+        const user = found.find((document) => document.name === userName);
+        const used = found.find((document) => document.name === usedName);
+        if (!user) throw new HttpError(404, "User document not found");
+        if (used) throw new HttpError(400, "Promo code already used");
+
+        const writes = [];
+
+        if (promo.type === "stars") {
+          const stars = Math.max(0, readFirestoreInt(user, "shadowStars"));
+          writes.push({
+            update: {
+              name: userName,
+              fields: { shadowStars: firestoreInt(stars + promo.amount) },
+            },
+            updateMask: { fieldPaths: ["shadowStars"] },
+          });
+        } else {
+          const existing = readFirestoreTimestamp(user, "premiumUntil");
+          const now = new Date();
+          const base = existing && existing > now ? existing : now;
+          const expiry = new Date(base.getTime() + promo.days * 86400000);
+
+          writes.push({
+            update: {
+              name: userName,
+              fields: { premiumUntil: { timestampValue: expiry.toISOString() } },
+            },
+            updateMask: { fieldPaths: ["premiumUntil"] },
+          });
+        }
+
+        writes.push({
+          update: {
+            name: usedName,
+            fields: {
+              uid: { stringValue: uid },
+              code: { stringValue: code },
+              usedAt: { timestampValue: new Date().toISOString() },
+            },
+          },
+          updateMask: {
+            fieldPaths: ["uid", "code", "usedAt"],
+          },
+        });
+
+        return writes;
+      },
+    );
+
+    return json({ ok: true, code }, 200, corsHeaders);
+  }
+
+  throw new HttpError(400, "Unknown economy action");
+}
+
+async function firestoreRunQuery(
+  env,
+  accessToken,
+  collection,
+  field,
+  value,
+) {
+  const result = await firestoreRequest(
+    env,
+    accessToken,
+    ":runQuery",
+    "POST",
+    {
+      structuredQuery: {
+        from: [{ collectionId: collection }],
+        where: {
+          fieldFilter: {
+            field: { fieldPath: field },
+            op: "EQUAL",
+            value: { stringValue: value },
+          },
+        },
+        limit: 1,
+      },
+    },
+  );
+
+  if (!Array.isArray(result)) return [];
+  return result
+    .filter((item) => item.document)
+    .map((item) => item.document);
+}
+
+function readFirestoreBool(document, fieldName) {
+  return document?.fields?.[fieldName]?.booleanValue === true;
+}
+
+function readFirestoreTimestamp(document, fieldName) {
+  const value = document?.fields?.[fieldName]?.timestampValue;
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function isReasonableClientDate(value) {
