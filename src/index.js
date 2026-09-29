@@ -2416,6 +2416,8 @@ async function writeModerationLog(
 }
 
 async function uploadFile(request, env, corsHeaders) {
+  await requireFirebaseUser(request, env);
+
   const url = new URL(request.url);
 
   const originalName =
