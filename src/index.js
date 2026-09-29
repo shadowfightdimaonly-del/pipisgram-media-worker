@@ -327,6 +327,14 @@ function firestoreInt(value) {
   };
 }
 
+function readFirestoreStringArray(document, fieldName) {
+  const values = document?.fields?.[fieldName]?.arrayValue?.values;
+  if (!Array.isArray(values)) return [];
+  return values
+    .map((value) => value?.stringValue)
+    .filter((value) => typeof value === "string");
+}
+
 function readFirestoreInt(document, fieldName, fallback = 0) {
   const value = document?.fields?.[fieldName];
 
@@ -1353,6 +1361,105 @@ async function economyAction(request, env, corsHeaders) {
     );
 
     return json({ ok: true, code }, 200, corsHeaders);
+  }
+
+  if (action === "takeover_remove_participant") {
+    const chatId = String(payload.chatId || "").trim();
+
+    if (!chatId || !targetUid) {
+      throw new HttpError(400, "Missing chat or target user");
+    }
+    if (targetUid === uid) {
+      throw new HttpError(400, "Нельзя удалить себя");
+    }
+
+    const accessToken = await getFirestoreAccessToken(env);
+    const actorName = firestoreDocumentName(env, "users", uid);
+    const chatName = firestoreDocumentName(env, "chats", chatId);
+    const cooldownField = "takeoverCooldownUntil_" + uid;
+
+    await runFirestoreTransaction(
+      env,
+      accessToken,
+      [actorName, chatName],
+      (found) => {
+        const actor = found.find((document) => document.name === actorName);
+        const chat = found.find((document) => document.name === chatName);
+
+        if (!actor || !chat) {
+          throw new HttpError(404, "Group not found");
+        }
+
+        if (!readFirestoreBool(actor, "hasGiftGroupTakeover")) {
+          throw new HttpError(403, "Этот подарок не активен");
+        }
+
+        const premiumUntil = readFirestoreTimestamp(actor, "premiumUntil");
+        const premiumActive =
+          readFirestoreBool(actor, "isPremium") ||
+          (premiumUntil && premiumUntil > new Date());
+        if (!premiumActive) {
+          throw new HttpError(403, "Premium required");
+        }
+
+        const participants = readFirestoreStringArray(chat, "participants");
+        const ownerUid = chat.fields?.createdBy?.stringValue || "";
+
+        if (!participants.includes(uid)) {
+          throw new HttpError(403, "Вы не участник группы");
+        }
+        if (!participants.includes(targetUid)) {
+          throw new HttpError(404, "Участник уже удалён");
+        }
+        if (targetUid === ownerUid) {
+          throw new HttpError(403, "Владельца группы удалить нельзя");
+        }
+
+        const cooldown = readFirestoreTimestamp(chat, cooldownField);
+        if (cooldown && cooldown > new Date()) {
+          const minutes = Math.ceil(
+            (cooldown.getTime() - Date.now()) / 60000,
+          );
+          throw new HttpError(
+            429,
+            "Подарок на перезарядке. Ещё примерно " + minutes + " мин.",
+          );
+        }
+
+        const nextParticipants = participants.filter(
+          (participant) => participant !== targetUid,
+        );
+
+        return [{
+          update: {
+            name: chatName,
+            fields: {
+              participants: {
+                arrayValue: {
+                  values: nextParticipants.map((participant) => ({
+                    stringValue: participant,
+                  })),
+                },
+              },
+              [cooldownField]: {
+                timestampValue: new Date(
+                  Date.now() + 10 * 60 * 1000,
+                ).toISOString(),
+              },
+            },
+          },
+          updateMask: {
+            fieldPaths: ["participants", cooldownField],
+          },
+        }];
+      },
+    );
+
+    return json(
+      { ok: true, targetUid },
+      200,
+      corsHeaders,
+    );
   }
 
   if (action === "change_user_username") {
