@@ -793,26 +793,13 @@ async function dinoCashOut(request, env, corsHeaders) {
     );
   }
 
-  if (!Number.isInteger(jumps) || jumps <= 0 || jumps > 1000) {
+  if (!Number.isInteger(jumps) || jumps <= 0) {
     return json(
       {
         ok: false,
         error: "Invalid jumps",
       },
       400,
-      corsHeaders,
-    );
-  }
-
-  const payout = Math.floor(jumps / 2);
-  if (payout <= 0) {
-    return json(
-      {
-        ok: true,
-        stars: 0,
-        accepted: true,
-      },
-      200,
       corsHeaders,
     );
   }
@@ -839,16 +826,22 @@ async function dinoCashOut(request, env, corsHeaders) {
 
       const cashedOutJumps = Math.max(
         0,
-        Math.min(1000, readFirestoreInt(game, "cashedOutJumps")),
+        readFirestoreInt(game, "cashedOutJumps"),
       );
 
-      acceptedJumps = Math.min(jumps, 1000 - cashedOutJumps);
+      acceptedJumps = jumps;
       if (acceptedJumps <= 0) {
         awardedStars = 0;
         return [];
       }
 
-      awardedStars = Math.floor(acceptedJumps / 2);
+      const premiumUntil = readFirestoreTimestamp(user, "premiumUntil");
+      const premiumActive =
+        readFirestoreBool(user, "isPremium") ||
+        (premiumUntil && premiumUntil > new Date());
+      awardedStars = premiumActive
+        ? acceptedJumps
+        : Math.floor(acceptedJumps / 2);
 
       const currentStars = Math.max(
         0,
