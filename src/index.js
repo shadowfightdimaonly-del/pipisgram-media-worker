@@ -675,12 +675,17 @@ async function guessNumber(request, env, corsHeaders) {
       const game = found.find((document) => document.name === gameName);
       const user = found.find((document) => document.name === userName);
 
+      const maxAttempts =
+        user && readFirestoreBool(user, "hasGiftDoubleGuessAttempts")
+          ? 6
+          : 3;
+
       const used = Math.max(
         0,
-        Math.min(3, readFirestoreInt(game, "attempts")),
+        Math.min(maxAttempts, readFirestoreInt(game, "attempts")),
       );
 
-      if (used >= 3) {
+      if (used >= maxAttempts) {
         attempts = used;
         attemptsLeft = 0;
         return [];
@@ -691,7 +696,7 @@ async function guessNumber(request, env, corsHeaders) {
       }
 
       attempts = used + 1;
-      attemptsLeft = 3 - attempts;
+      attemptsLeft = maxAttempts - attempts;
 
       const writes = [
         {
@@ -1070,8 +1075,8 @@ async function economyAction(request, env, corsHeaders) {
     if (action === "buy_gift" || action === "gift") {
       const giftId = String(payload.giftId || "");
       const gifts = {
-        "1": { price: 120, field: "hasGiftEditMessages", requiresPremium: false },
-        "2": { price: 215, field: "hasGiftChangeAvatars", requiresPremium: false },
+        "1": { price: 150, field: "hasGiftChangeUsernames", requiresPremium: false },
+        "2": { price: 235, field: "hasGiftDoubleGuessAttempts", requiresPremium: false },
         "3": { price: 570, field: "hasGiftGroupTakeover", requiresPremium: true },
       };
       const gift = gifts[giftId];
@@ -1315,6 +1320,71 @@ async function economyAction(request, env, corsHeaders) {
     );
 
     return json({ ok: true, code }, 200, corsHeaders);
+  }
+
+  if (action === "change_user_username") {
+    const newUsername = String(payload.newUsername || "").trim();
+
+    if (!targetUid) throw new HttpError(400, "Missing target user");
+    if (!newUsername || newUsername.length < 3 || newUsername.length > 32) {
+      throw new HttpError(400, "Username must be 3-32 characters");
+    }
+    if (!/^[A-Za-z0-9_]+$/.test(newUsername)) {
+      throw new HttpError(400, "Username may contain only letters, numbers and _");
+    }
+    if (targetUid === uid) {
+      throw new HttpError(400, "Use the normal username change for yourself");
+    }
+
+    const accessToken = await getFirestoreAccessToken(env);
+    const actorName = firestoreDocumentName(env, "users", uid);
+    const targetName = firestoreDocumentName(env, "users", targetUid);
+
+    const duplicates = await firestoreRunQuery(
+      env,
+      accessToken,
+      "users",
+      "username",
+      newUsername,
+    );
+    if (duplicates.some((document) => document.name !== targetName)) {
+      throw new HttpError(409, "Этот username уже занят");
+    }
+
+    await runFirestoreTransaction(
+      env,
+      accessToken,
+      [actorName, targetName],
+      (found) => {
+        const actor = found.find((document) => document.name === actorName);
+        const target = found.find((document) => document.name === targetName);
+
+        if (!actor || !target) {
+          throw new HttpError(404, "User not found");
+        }
+        if (!readFirestoreBool(actor, "hasGiftChangeUsernames")) {
+          throw new HttpError(403, "Этот подарок не активен");
+        }
+
+        return [{
+          update: {
+            name: targetName,
+            fields: {
+              username: { stringValue: newUsername },
+            },
+          },
+          updateMask: {
+            fieldPaths: ["username"],
+          },
+        }];
+      },
+    );
+
+    return json(
+      { ok: true, targetUid, username: newUsername },
+      200,
+      corsHeaders,
+    );
   }
 
   throw new HttpError(400, "Unknown economy action");
