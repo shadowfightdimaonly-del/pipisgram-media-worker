@@ -55,6 +55,14 @@ export default {
         return await guessNumber(request, env, corsHeaders);
       }
 
+      // POST /economy/dino/status
+      if (
+        url.pathname === "/economy/dino/status" &&
+        request.method === "POST"
+      ) {
+        return await dinoStatus(request, env, corsHeaders);
+      }
+
       // POST /economy/dino/cashout
       if (
         url.pathname === "/economy/dino/cashout" &&
@@ -324,6 +332,12 @@ function firestoreDocumentName(env, collection, docId) {
 function firestoreInt(value) {
   return {
     integerValue: String(value),
+  };
+}
+
+function firestoreTimestamp(date) {
+  return {
+    timestampValue: date.toISOString(),
   };
 }
 
@@ -777,128 +791,122 @@ async function guessNumber(request, env, corsHeaders) {
   );
 }
 
+async function dinoStatus(request, env, corsHeaders) {
+  const uid = await requireFirebaseUser(request, env);
+  const accessToken = await getFirestoreAccessToken(env);
+  const userName = firestoreDocumentName(env, "users", uid);
+  const gameName = firestoreDocumentName(env, "gameStats", uid + "_dino");
+  const batch = await firestoreRequest(env, accessToken, ":batchGet", "POST", {
+    documents: [userName, gameName],
+  });
+  const found = Array.isArray(batch) ? batch.filter((item) => item.found).map((item) => item.found) : [];
+  const user = found.find((doc) => doc.name === userName);
+  const game = found.find((doc) => doc.name === gameName);
+  if (!user) throw new HttpError(500, "User document not found");
+
+  const premiumUntil = readFirestoreTimestamp(user, "premiumUntil");
+  const premiumActive = readFirestoreBool(user, "isPremium") ||
+    (premiumUntil && premiumUntil > new Date());
+  const limit = premiumActive ? 485 : 350;
+  const resetMs = premiumActive ? 3.5 * 60 * 60 * 1000 : 5 * 60 * 60 * 1000;
+
+  let windowStartedAt = readFirestoreTimestamp(game, "windowStartedAt");
+  let usedJumps = Math.max(0, readFirestoreInt(game, "cashedOutJumps"));
+
+  if (!windowStartedAt || Date.now() - windowStartedAt.getTime() >= resetMs) {
+    windowStartedAt = new Date();
+    usedJumps = 0;
+  }
+
+  return json({
+    ok: true,
+    limit,
+    usedJumps,
+    remaining: Math.max(0, limit - usedJumps),
+    resetAt: new Date(windowStartedAt.getTime() + resetMs).toISOString(),
+  }, 200, corsHeaders);
+}
+
 async function dinoCashOut(request, env, corsHeaders) {
   const uid = await requireFirebaseUser(request, env);
-
   let payload = {};
-  try {
-    payload = await request.json();
-  } catch (_) {
-    payload = {};
-  }
+  try { payload = await request.json(); } catch (_) {}
 
   const jumps = Number(payload.jumps);
-  const date = String(payload.date || "");
-
-  if (!isReasonableClientDate(date)) {
-    return json(
-      {
-        ok: false,
-        error: "Invalid or stale Dino date",
-      },
-      400,
-      corsHeaders,
-    );
-  }
-
   if (!Number.isInteger(jumps) || jumps <= 0) {
-    return json(
-      {
-        ok: false,
-        error: "Invalid jumps",
-      },
-      400,
-      corsHeaders,
-    );
+    throw new HttpError(400, "Invalid jumps");
   }
 
   const accessToken = await getFirestoreAccessToken(env);
-  const gameDocId = uid + "_dino_" + date;
-  const gameName = firestoreDocumentName(env, "gameStats", gameDocId);
   const userName = firestoreDocumentName(env, "users", uid);
-
+  const gameName = firestoreDocumentName(env, "gameStats", uid + "_dino");
   let acceptedJumps = 0;
   let awardedStars = 0;
+  let limit = 350;
+  let remaining = 0;
+  let resetAt = null;
 
-  await runFirestoreTransaction(
-    env,
-    accessToken,
-    [gameName, userName],
-    (found) => {
-      const game = found.find((document) => document.name === gameName);
-      const user = found.find((document) => document.name === userName);
+  await runFirestoreTransaction(env, accessToken, [gameName, userName], (found) => {
+    const game = found.find((document) => document.name === gameName);
+    const user = found.find((document) => document.name === userName);
+    if (!user) throw new HttpError(500, "User document not found");
 
-      if (!user) {
-        throw new HttpError(500, "User document not found");
-      }
+    const premiumUntil = readFirestoreTimestamp(user, "premiumUntil");
+    const premiumActive = readFirestoreBool(user, "isPremium") ||
+      (premiumUntil && premiumUntil > new Date());
+    limit = premiumActive ? 485 : 350;
+    const resetMs = premiumActive ? 3.5 * 60 * 60 * 1000 : 5 * 60 * 60 * 1000;
 
-      const cashedOutJumps = Math.max(
-        0,
-        readFirestoreInt(game, "cashedOutJumps"),
-      );
+    let windowStartedAt = readFirestoreTimestamp(game, "windowStartedAt");
+    let usedJumps = Math.max(0, readFirestoreInt(game, "cashedOutJumps"));
 
-      acceptedJumps = jumps;
-      if (acceptedJumps <= 0) {
-        awardedStars = 0;
-        return [];
-      }
+    if (!windowStartedAt || Date.now() - windowStartedAt.getTime() >= resetMs) {
+      windowStartedAt = new Date();
+      usedJumps = 0;
+    }
 
-      const premiumUntil = readFirestoreTimestamp(user, "premiumUntil");
-      const premiumActive =
-        readFirestoreBool(user, "isPremium") ||
-        (premiumUntil && premiumUntil > new Date());
-      awardedStars = premiumActive
-        ? acceptedJumps
-        : Math.floor(acceptedJumps / 2);
+    acceptedJumps = Math.min(jumps, Math.max(0, limit - usedJumps));
+    awardedStars = premiumActive ? acceptedJumps : Math.floor(acceptedJumps / 2);
+    usedJumps += acceptedJumps;
+    remaining = Math.max(0, limit - usedJumps);
+    resetAt = new Date(windowStartedAt.getTime() + resetMs).toISOString();
 
-      const currentStars = Math.max(
-        0,
-        readFirestoreInt(user, "shadowStars"),
-      );
+    const writes = [{
+      update: {
+        name: gameName,
+        fields: {
+          windowStartedAt: firestoreTimestamp(windowStartedAt),
+          cashedOutJumps: firestoreInt(usedJumps),
+        },
+      },
+      updateMask: { fieldPaths: ["windowStartedAt", "cashedOutJumps"] },
+    }];
 
-      const writes = [
-        {
-          update: {
-            name: gameName,
-            fields: {
-              cashedOutJumps: firestoreInt(
-                cashedOutJumps + acceptedJumps,
-              ),
-            },
-          },
-          updateMask: {
-            fieldPaths: ["cashedOutJumps"],
+    if (awardedStars > 0) {
+      writes.push({
+        update: {
+          name: userName,
+          fields: {
+            shadowStars: firestoreInt(
+              Math.max(0, readFirestoreInt(user, "shadowStars")) + awardedStars,
+            ),
           },
         },
-        {
-          update: {
-            name: userName,
-            fields: {
-              shadowStars: firestoreInt(
-                currentStars + awardedStars,
-              ),
-            },
-          },
-          updateMask: {
-            fieldPaths: ["shadowStars"],
-          },
-        },
-      ];
+        updateMask: { fieldPaths: ["shadowStars"] },
+      });
+    }
+    return writes;
+  });
 
-      return writes;
-    },
-  );
-
-  return json(
-    {
-      ok: true,
-      accepted: acceptedJumps > 0,
-      jumps: acceptedJumps,
-      stars: awardedStars,
-    },
-    200,
-    corsHeaders,
-  );
+  return json({
+    ok: true,
+    accepted: acceptedJumps > 0,
+    jumps: acceptedJumps,
+    stars: awardedStars,
+    limit,
+    remaining,
+    resetAt,
+  }, 200, corsHeaders);
 }
 
 async function economyAction(request, env, corsHeaders) {
