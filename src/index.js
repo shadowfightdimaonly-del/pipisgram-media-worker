@@ -1075,9 +1075,11 @@ async function economyAction(request, env, corsHeaders) {
     if (action === "buy_gift" || action === "gift") {
       const giftId = String(payload.giftId || "");
       const gifts = {
-        "1": { price: 150, field: "hasGiftChangeUsernames", requiresPremium: false },
-        "2": { price: 235, field: "hasGiftDoubleGuessAttempts", requiresPremium: false },
+        "1": { price: 120, field: "hasGiftEditMessages", requiresPremium: false },
+        "2": { price: 215, field: "hasGiftChangeAvatars", requiresPremium: false },
         "3": { price: 570, field: "hasGiftGroupTakeover", requiresPremium: true },
+        "4": { price: 150, field: "hasGiftChangeUsernames", requiresPremium: false },
+        "5": { price: 235, field: "hasGiftDoubleGuessAttempts", requiresPremium: false },
       };
       const gift = gifts[giftId];
       if (!gift) throw new HttpError(400, "Invalid gift");
