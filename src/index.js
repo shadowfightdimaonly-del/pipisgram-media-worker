@@ -448,15 +448,24 @@ async function clickerTap(request, env, corsHeaders) {
   await runFirestoreTransaction(
     env,
     accessToken,
-    [gameName],
+    [gameName, firestoreDocumentName(env, "users", uid)],
     (found) => {
       const game = found.find(
         (document) => document.name === gameName,
       );
+      const user = found.find(
+        (document) => document.name === firestoreDocumentName(env, "users", uid),
+      );
 
       const current = readFirestoreInt(game, "taps");
       taps = current;
-      if (current >= 1000) {
+      const premiumUntil = readFirestoreTimestamp(user, "premiumUntil");
+      const premiumActive =
+        readFirestoreBool(user, "isPremium") ||
+        (premiumUntil && premiumUntil > new Date());
+      const maxTaps = premiumActive ? 500 : 250;
+
+      if (current >= maxTaps) {
         return [];
       }
 
@@ -541,9 +550,14 @@ async function clickerCashOut(request, env, corsHeaders) {
         (document) => document.name === userName,
       );
 
+      const premiumUntil = readFirestoreTimestamp(user, "premiumUntil");
+      const premiumActive =
+        readFirestoreBool(user, "isPremium") ||
+        (premiumUntil && premiumUntil > new Date());
+      const maxTaps = premiumActive ? 500 : 250;
       const taps = Math.max(
         0,
-        Math.min(1000, readFirestoreInt(game, "taps")),
+        Math.min(maxTaps, readFirestoreInt(game, "taps")),
       );
       const cashedOutTaps = Math.max(
         0,
@@ -675,10 +689,16 @@ async function guessNumber(request, env, corsHeaders) {
       const game = found.find((document) => document.name === gameName);
       const user = found.find((document) => document.name === userName);
 
+      const premiumActive = user && (
+        readFirestoreBool(user, "isPremium") ||
+        (() => {
+          const expiry = readFirestoreTimestamp(user, "premiumUntil");
+          return expiry && expiry > new Date();
+        })()
+      );
       const maxAttempts =
-        user && readFirestoreBool(user, "hasGiftDoubleGuessAttempts")
-          ? 6
-          : 3;
+        (premiumActive ? 6 : 3) +
+        (user && readFirestoreBool(user, "hasGiftDoubleGuessAttempts") ? 3 : 0);
 
       const used = Math.max(
         0,
@@ -898,6 +918,21 @@ async function economyAction(request, env, corsHeaders) {
     throw new HttpError(400, "Missing economy action");
   }
 
+  if (action === "registered_users_count") {
+    const accessToken = await getFirestoreAccessToken(env);
+    const query = await listFirestoreDocuments(env, accessToken, "users");
+    const userName = firestoreDocumentName(env, "users", uid);
+    const userDocs = query || [];
+    const current = userDocs.find((document) => document.name === userName);
+    if (!current) throw new HttpError(404, "User not found");
+    const premiumUntil = readFirestoreTimestamp(current, "premiumUntil");
+    const premiumActive =
+      readFirestoreBool(current, "isPremium") ||
+      (premiumUntil && premiumUntil > new Date());
+    if (!premiumActive) throw new HttpError(403, "Premium required");
+    return json({ ok: true, count: userDocs.length }, 200, corsHeaders);
+  }
+
   if (action === "admin_star") {
     if (!Number.isInteger(amount) || amount < 1 || amount > 1000) {
       throw new HttpError(400, "Amount must be from 1 to 1000");
@@ -1075,7 +1110,7 @@ async function economyAction(request, env, corsHeaders) {
     if (action === "buy_gift" || action === "gift") {
       const giftId = String(payload.giftId || "");
       const gifts = {
-        "1": { price: 120, field: "hasGiftEditMessages", requiresPremium: false },
+        "1": { price: 125, field: "hasGiftEditMessages", requiresPremium: false },
         "2": { price: 215, field: "hasGiftChangeAvatars", requiresPremium: false },
         "3": { price: 570, field: "hasGiftGroupTakeover", requiresPremium: true },
         "4": { price: 150, field: "hasGiftChangeUsernames", requiresPremium: false },
@@ -1101,25 +1136,28 @@ async function economyAction(request, env, corsHeaders) {
           const recipient = found.find((document) => document.name === recipientName);
           if (!user || !recipient) throw new HttpError(404, "User not found");
 
-          if (gift.requiresPremium) {
-            const premiumUntil = readFirestoreTimestamp(user, "premiumUntil");
-            const premiumActive =
-              readFirestoreBool(user, "isPremium") ||
-              (premiumUntil && premiumUntil > new Date());
-            if (!premiumActive) {
-              throw new HttpError(400, "Premium required");
-            }
+          const premiumUntil = readFirestoreTimestamp(user, "premiumUntil");
+          const premiumActive =
+            readFirestoreBool(user, "isPremium") ||
+            (premiumUntil && premiumUntil > new Date());
+
+          if (gift.requiresPremium && !premiumActive) {
+            throw new HttpError(400, "Premium required");
           }
 
+          const price = premiumActive
+            ? Math.max(0, gift.price - 25)
+            : gift.price;
+
           const stars = Math.max(0, readFirestoreInt(user, "shadowStars"));
-          if (stars < gift.price) throw new HttpError(400, "Not enough stars");
+          if (stars < price) throw new HttpError(400, "Not enough stars");
 
           if (recipientUid === uid) {
             return [{
               update: {
                 name: userName,
                 fields: {
-                  shadowStars: firestoreInt(stars - gift.price),
+                  shadowStars: firestoreInt(stars - price),
                   [gift.field]: { booleanValue: true },
                 },
               },
@@ -1133,7 +1171,7 @@ async function economyAction(request, env, corsHeaders) {
             {
               update: {
                 name: userName,
-                fields: { shadowStars: firestoreInt(stars - gift.price) },
+                fields: { shadowStars: firestoreInt(stars - price) },
               },
               updateMask: { fieldPaths: ["shadowStars"] },
             },
@@ -1148,7 +1186,7 @@ async function economyAction(request, env, corsHeaders) {
         },
       );
 
-      return json({ ok: true, price: gift.price, giftId }, 200, corsHeaders);
+      return json({ ok: true, price, giftId }, 200, corsHeaders);
     }
   }
 
@@ -1390,6 +1428,16 @@ async function economyAction(request, env, corsHeaders) {
   }
 
   throw new HttpError(400, "Unknown economy action");
+}
+
+async function listFirestoreDocuments(env, accessToken, collection) {
+  const response = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/${collection}?pageSize=1000`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+  if (!response.ok) throw new HttpError(502, "Firestore list failed");
+  const data = await response.json();
+  return data.documents || [];
 }
 
 async function firestoreRunQuery(
