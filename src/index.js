@@ -728,7 +728,7 @@ async function guessNumber(request, env, corsHeaders) {
       );
 
       if (used >= maxAttempts) {
-        attempts = used;
+        attempts = 0;
         attemptsLeft = 0;
         return [];
       }
