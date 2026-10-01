@@ -1555,24 +1555,27 @@ async function firestoreRunQuery(
   field,
   value,
 ) {
+  const structuredQuery = {
+    from: [{ collectionId: collection }],
+    limit: field ? 20 : 200,
+  };
+
+  if (field) {
+    structuredQuery.where = {
+      fieldFilter: {
+        field: { fieldPath: field },
+        op: "EQUAL",
+        value: { stringValue: value },
+      },
+    };
+  }
+
   const result = await firestoreRequest(
     env,
     accessToken,
     ":runQuery",
     "POST",
-    {
-      structuredQuery: {
-        from: [{ collectionId: collection }],
-        where: {
-          fieldFilter: {
-            field: { fieldPath: field },
-            op: "EQUAL",
-            value: { stringValue: value },
-          },
-        },
-        limit: 1,
-      },
-    },
+    { structuredQuery },
   );
 
   if (!Array.isArray(result)) return [];
@@ -1738,6 +1741,28 @@ async function adminAction(request, env, corsHeaders) {
         );
         if (doc) candidates.set(doc.name, doc);
       } catch (_) {}
+    }
+
+    // Firestore equality is case-sensitive. If an exact username
+    // lookup found nothing, scan a bounded set of users and compare
+    // usernames case-insensitively so "Dima" and "dima" behave alike.
+    if (candidates.size === 0 && normalized) {
+      const allUsers = await firestoreRunQuery(
+        env,
+        accessToken,
+        "users",
+        null,
+        null,
+      );
+      const normalizedLower = normalized.toLowerCase();
+      for (const doc of allUsers) {
+        const username =
+          doc.fields?.username?.stringValue?.toLowerCase() || "";
+        if (username === normalizedLower) {
+          candidates.set(doc.name, doc);
+          break;
+        }
+      }
     }
 
     const found = [...candidates.values()];
