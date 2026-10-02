@@ -997,8 +997,7 @@ async function economyAction(request, env, corsHeaders) {
 
       const targetName = firestoreDocumentName(env, "users", targetUid);
       await runFirestoreTransaction(
-        env,
-        accessToken,
+        env,        accessToken,
         [userName, targetName],
         (found) => {
           const user = found.find((document) => document.name === userName);
@@ -1997,8 +1996,7 @@ async function supportAppeal(request, env, corsHeaders) {
           },
         },
         {
-          update: {
-            name: messageName,
+          update: {            name: messageName,
             fields: {
               senderUid: { stringValue: ownerUid },
               text: { stringValue: message },
@@ -2774,3 +2772,4 @@ async function getSignatureKey(
     kService,
     "aws4_request",
   );
+}
